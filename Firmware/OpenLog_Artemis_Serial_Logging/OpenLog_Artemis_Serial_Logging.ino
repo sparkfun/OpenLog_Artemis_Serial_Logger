@@ -10,12 +10,15 @@
   Feel like supporting our work? Buy a board from SparkFun!
   https://www.sparkfun.com/products/16832
 
-  This firmware runs the OpenLog Artemis abd is dedicated to logging serial data via the RX pin.
+  This firmware runs the OpenLog Artemis and is dedicated to logging serial data via the RX pin.
+  The code uses two threads to buffer the incoming serial data and write it to SD card.
   A large variety of system settings can be adjusted by connecting at 115200bps.
 
   The Board should be set to SparkFun Apollo3 \ RedBoard Artemis ATP.
 
   Please note: this version of the firmware compiles on v2.1.0 of the Apollo3 boards.
+
+  The code uses v2.0.7 of SdFat by Bill Greiman (_not_ v2.1.0).
 
 */
 
@@ -125,7 +128,7 @@ Apollo3RTC myRTC; //Create instance of RTC class
 volatile unsigned long lastSeriaLogSyncTime = 0;
 const unsigned long MAX_IDLE_TIME_MSEC = 1000;
 #define incomingBufferSize (512*64)
-static char incomingBuffer[incomingBufferSize]; //This size of this buffer is sensitive
+volatile char incomingBuffer[incomingBufferSize]; //This size of this buffer is sensitive
 volatile int incomingBufferSpot = 0;
 volatile unsigned long charsReceived = 0; //Used for verifying/debugging serial reception
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
@@ -138,7 +141,8 @@ volatile static bool stopLoggingSeen = false; //Flag to indicate if we should st
 volatile int lowBatteryReadings = 0; // Count how many times the battery voltage has read low
 const int lowBatteryReadingsLimit = 10; // Don't declare the battery voltage low until we have had this many consecutive low readings (to reject sampling noise)
 volatile static bool triggerEdgeSeen = false; //Flag to indicate if a trigger interrupt has been seen
-static char serialTimestamp[40]; //Buffer to store serial timestamp, if needed
+volatile char serialTimestamp[40]; //Buffer to store serial timestamp, if needed
+volatile size_t timestampCharsLeftToWrite = 0; // The length of serialTimestamp
 volatile static bool powerLossSeen = false; //Flag to indicate if a power loss event has been seen
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
@@ -179,8 +183,6 @@ void thread_serial_rx(void)
   {
     if (threadSerialRXrun)
     {
-      size_t timestampCharsLeftToWrite = strlen(serialTimestamp);
-    
       if (Serial1.available() || (timestampCharsLeftToWrite > 0))
       {
         while (Serial1.available() || (timestampCharsLeftToWrite > 0))
@@ -189,10 +191,8 @@ void thread_serial_rx(void)
           {
             incomingBuffer[incomingBufferSpot] = serialTimestamp[0]; // Add a timestamp character to incomingBuffer
     
-            for (size_t i = 0; i < timestampCharsLeftToWrite; i++)
-            {
-              serialTimestamp[i] = serialTimestamp[i+1]; // Shuffle the remaining chars along by one
-            }
+            // Shuffle the remaining chars along by one
+            memmove((void *)&serialTimestamp[0], (const void *)&serialTimestamp[1], (size_t)timestampCharsLeftToWrite);
     
             timestampCharsLeftToWrite -= 1;
           }
@@ -207,6 +207,7 @@ void thread_serial_rx(void)
               serialTimestamp[0] = '\r'; // Add Carriage Return and Line Feed at the start of the timestamp
               serialTimestamp[1] = '\n';
               serialTimestamp[2] = '^'; // Add an up-arrow to indicate the timestamp relates to the preceeding data
+              timestampCharsLeftToWrite = strlen((const char *)&serialTimestamp[0]);
             }
           }
     
@@ -239,9 +240,9 @@ void thread_sd_write(void)
         while (incomingBufferSpot >= 512) // Is there enough data in the buffer for a complete write?
         {
           digitalWrite(PIN_STAT_LED, HIGH); //Toggle stat LED to indicating log recording
-          serialDataFile.write(incomingBuffer, 512); //Record the buffer to the card
+          serialDataFile.write((const uint8_t *)&incomingBuffer[0], 512); //Record the buffer to the card
           digitalWrite(PIN_STAT_LED, LOW);
-          memmove(&incomingBuffer[0], &incomingBuffer[512], incomingBufferSize - 512);
+          memmove((void *)&incomingBuffer[0], (const void *)&incomingBuffer[512], (size_t)(incomingBufferSize - 512));
           incomingBufferSpot -= 512;
     
           if ((millis() - lastSeriaLogSyncTime) > MAX_IDLE_TIME_MSEC) //Should we sync the log file?
@@ -257,7 +258,7 @@ void thread_sd_write(void)
           {
             //Write the remainder of the buffer
             digitalWrite(PIN_STAT_LED, HIGH); //Toggle stat LED to indicating log recording
-            serialDataFile.write(incomingBuffer, incomingBufferSpot); //Record the buffer to the card
+            serialDataFile.write((const uint8_t *)&incomingBuffer[0], (size_t)incomingBufferSpot); //Record the buffer to the card
             serialDataFile.sync();
             updateDataFileAccess(&serialDataFile); // Update the file access time & date
             digitalWrite(PIN_STAT_LED, LOW);
@@ -344,6 +345,8 @@ void setup() {
     triggerEdgeSeen = false; // Make sure the flag is clear
   }
 
+  analogReadResolution(14); //Increase from default of 10
+
   lastSDFileNameChangeTime = millis(); // Record the time of the file name change
 
   serialTimestamp[0] = '\0'; // Empty the serial timestamp buffer
@@ -358,6 +361,10 @@ void setup() {
 
   if (settings.enableTerminalOutput == false && online.serialLogging == true)
     SerialPrintln(F("Logging to microSD card with no terminal output"));
+
+  //Clear any spurious serial data
+  while (Serial1.available())
+    Serial1.read();
 
   //Start the threads
   thread1.start(thread_serial_rx);
@@ -383,12 +390,15 @@ void loop() {
   if (((settings.useGPIO11ForTrigger == true) && (triggerEdgeSeen == true))
    || ((settings.openNewLogFilesAfter > 0) && ((millis() - lastSDFileNameChangeTime) > (settings.openNewLogFilesAfter * 1000))))
   {
+    triggerEdgeSeen = false;
     openNewLogFile();
     lastSDFileNameChangeTime = millis(); // Record the time of the file name change
   }
 
   if ((settings.useGPIO32ForStopLogging == true) && (stopLoggingSeen == true)) // Has the user pressed the stop logging button?
   {
+    stopLoggingSeen = false;
+    threadSerialRXrun = false;
     stopLogging();
   }
 
@@ -573,7 +583,7 @@ void openNewLogFile()
     {
       //Write the remainder of the buffer
       digitalWrite(PIN_STAT_LED, HIGH); //Toggle stat LED to indicating log recording
-      serialDataFile.write(incomingBuffer, incomingBufferSpot); //Record the buffer to the card
+      serialDataFile.write((const uint8_t *)&incomingBuffer[0], (size_t)incomingBufferSpot); //Record the buffer to the card
       serialDataFile.sync();
       updateDataFileAccess(&serialDataFile); // Update the file access time & date
       digitalWrite(PIN_STAT_LED, LOW);

@@ -24,6 +24,9 @@ void checkBattery(void)
       
         delay(sdPowerDownDelay); // Give the SD card time to finish writing ***** THIS IS CRITICAL *****
 
+        SerialPrint(F("Battery voltage is "));
+        Serial.print(voltage);
+        SerialPrintln(F("V"));
         SerialPrintln(F("***      LOW BATTERY VOLTAGE DETECTED! GOING INTO POWERDOWN      ***"));
         SerialPrintln(F("*** PLEASE CHANGE THE POWER SOURCE AND RESET THE OLA TO CONTINUE ***"));
       

@@ -26,7 +26,27 @@ void menuPower()
 
     if (incoming == '1')
     {
-      settings.useGPIO32ForStopLogging ^= 1;
+      if (settings.useGPIO32ForStopLogging == true)
+      {
+        // Disable triggering
+        settings.useGPIO32ForStopLogging = false;
+        detachInterrupt(PIN_STOP_LOGGING); // Disable the interrupt
+        pinMode(PIN_STOP_LOGGING, INPUT); // Remove the pull-up
+        pin_config(PinName(PIN_STOP_LOGGING), g_AM_HAL_GPIO_INPUT); // Make sure the pin does actually get re-configured
+        stopLoggingSeen = false; // Make sure the flag is clear
+      }
+      else
+      {
+        // Enable triggering
+        settings.useGPIO32ForStopLogging = true;
+        pinMode(PIN_STOP_LOGGING, INPUT_PULLUP);
+        delay(1); // Let the pin stabilize
+        attachInterrupt(PIN_STOP_LOGGING, stopLoggingISR, FALLING); // Enable the interrupt
+        am_hal_gpio_pincfg_t intPinConfig = g_AM_HAL_GPIO_INPUT_PULLUP;
+        intPinConfig.eIntDir = AM_HAL_GPIO_PIN_INTDIR_HI2LO;
+        pin_config(PinName(PIN_STOP_LOGGING), intPinConfig); // Make sure the pull-up does actually stay enabled
+        stopLoggingSeen = false; // Make sure the flag is clear
+      }
     }
 #if(HARDWARE_VERSION_MAJOR >= 1)
     else if (incoming == '2')

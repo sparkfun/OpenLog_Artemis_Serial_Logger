@@ -1,7 +1,7 @@
 //Query the RTC and put the appropriately formatted (according to settings) 
-//string into the passed buffer. timeStringBuffer should be at least 37 chars long
+//string into the passed buffer.
 //Code modified by @DennisMelamed in PR #70
-void getTimeString(char timeStringBuffer[])
+void getTimeString(volatile char timeStringBuffer[])
 {
   //reset the buffer
   timeStringBuffer[0] = '\0';
@@ -28,7 +28,7 @@ void getTimeString(char timeStringBuffer[])
     sprintf(rtcDate, "%s/%s/%s,", rtcMonth, rtcDay, rtcYear);
   else
     sprintf(rtcDate, "%s/%s/%s,", rtcDay, rtcMonth, rtcYear);
-  strcat(timeStringBuffer, rtcDate);
+  strcat((char *)&timeStringBuffer[0], rtcDate);
 
   char rtcTime[14]; //09:14:37.41\r\n
   int adjustedHour = myRTC.hour;
@@ -57,5 +57,5 @@ void getTimeString(char timeStringBuffer[])
   else
     sprintf(rtcHundredths, "%d", myRTC.hundredths);
   sprintf(rtcTime, "%s:%s:%s.%s\r\n", rtcHour, rtcMin, rtcSec, rtcHundredths);
-  strcat(timeStringBuffer, rtcTime);
+  strcat((char *)&timeStringBuffer[0], rtcTime);
 }

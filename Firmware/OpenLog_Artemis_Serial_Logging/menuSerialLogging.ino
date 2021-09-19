@@ -77,9 +77,9 @@ void menuSerialLogging()
       settings.enableTerminalOutput ^= 1;
     else if (incoming == '3')
     {
-      SerialPrint(F("Enter baud rate (1200 to 500000): "));
+      SerialPrint(F("Enter baud rate (1200 to 921600): "));
       int newBaud = getNumber(menuTimeout); //Timeout after x seconds
-      if (newBaud < 1200 || newBaud > 500000)
+      if (newBaud < 1200 || newBaud > 921600)
       {
         SerialPrintln(F("Error: baud rate out of range"));
       }

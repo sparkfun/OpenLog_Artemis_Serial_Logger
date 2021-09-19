@@ -28,9 +28,9 @@ void menuLogRate()
 
     if (incoming == 1)
     {
-      SerialPrint(F("Enter baud rate (1200 to 500000): "));
+      SerialPrint(F("Enter baud rate (1200 to 1000000): "));
       int newBaud = getNumber(menuTimeout); //Timeout after x seconds
-      if (newBaud < 1200 || newBaud > 500000)
+      if (newBaud < 1200 || newBaud > 1000000)
       {
         SerialPrintln(F("Error: baud rate out of range"));
       }
@@ -50,6 +50,7 @@ void menuLogRate()
         
         settings.serialTerminalBaudRate = newBaud;
         recordSystemSettings(); //Normally recorded upon all menu exits
+        
         SerialPrintf2("Terminal now set at %dbps. Please reset device and open terminal at new baud rate. Freezing...\r\n", settings.serialTerminalBaudRate);
         while (1);
       }
