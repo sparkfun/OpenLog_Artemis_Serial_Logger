@@ -36,9 +36,7 @@ void menuLogRate()
       }
       else
       {
-        //Pause the threads
-        threadSerialRXrun = false;
-        threadSDrun = false;
+        pauseThreads();
         
         //Save files before going to sleep
         if (online.serialLogging == true)
@@ -52,7 +50,8 @@ void menuLogRate()
         recordSystemSettings(); //Normally recorded upon all menu exits
         
         SerialPrintf2("Terminal now set at %dbps. Please reset device and open terminal at new baud rate. Freezing...\r\n", settings.serialTerminalBaudRate);
-        while (1);
+        delay(sdPowerDownDelay); // Give the SD card time to shut down
+        powerDownOLA();
       }
     }
     else if (incoming == 2)

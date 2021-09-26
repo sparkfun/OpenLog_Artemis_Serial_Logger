@@ -48,6 +48,10 @@ void menuSerialLogging()
         break;
     }
 
+    SerialPrint(F("6) Echo data to TX pin: "));
+    if (settings.echoSerial == true) SerialPrintln(F("Enabled"));
+    else SerialPrintln(F("Disabled"));
+
     SerialPrintln(F("x) Exit"));
 
     byte incoming = getByteChoice(menuTimeout); //Timeout after x seconds
@@ -64,11 +68,16 @@ void menuSerialLogging()
       {
         if (online.serialLogging)
         {
+          pauseThreads();
+          
           //Shut it all down
+          serialDataFile.sync();
           updateDataFileAccess(&serialDataFile); // Update the file access time & date
           serialDataFile.close();
 
           online.serialLogging = false;
+
+          restartThreads();
         }
         settings.logSerial = false;
       }
@@ -77,9 +86,9 @@ void menuSerialLogging()
       settings.enableTerminalOutput ^= 1;
     else if (incoming == '3')
     {
-      SerialPrint(F("Enter baud rate (1200 to 921600): "));
+      SerialPrint(F("Enter baud rate (1200 to 1000000): "));
       int newBaud = getNumber(menuTimeout); //Timeout after x seconds
-      if (newBaud < 1200 || newBaud > 921600)
+      if (newBaud < 1200 || newBaud > 1000000)
       {
         SerialPrintln(F("Error: baud rate out of range"));
       }
@@ -105,6 +114,8 @@ void menuSerialLogging()
         settings.timeStampToken = (uint8_t)newToken;
       }
     }
+    else if (incoming == '6')
+      settings.echoSerial ^= 1;
     else if (incoming == 'x')
       return;
     else if (incoming == STATUS_GETBYTE_TIMEOUT)

@@ -13,6 +13,12 @@ OpenLog Artemis is highly configurable over an easy to use serial interface. Sim
 
 New features are constantly being added so we’ve released an easy to use firmware upgrade tool. No need to install Arduino or a bunch of libraries, simply open the [Artemis Firmware Upload GUI](https://github.com/sparkfun/Artemis-Firmware-Upload-GUI), load the latest OLA firmware, and add features to OpenLog Artemis as they come out! Full instructions are available in [UPGRADE.md](./UPGRADE.md).
 
+Limitations
+-------------------
+
+This firmware works well with baud rates up to 230400. Near-continuous (80% duty, ~20KB/s) logging of NMEA data at 230400 produces clean log files.
+The wheels come off at 460800 baud, for reasons we don't yet understand.
+
 Repository Contents
 -------------------
 

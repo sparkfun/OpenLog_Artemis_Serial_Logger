@@ -84,6 +84,7 @@ void recordSystemSettingsToFile()
     settingsFile.println("serialTerminalBaudRate=" + (String)settings.serialTerminalBaudRate);
     settingsFile.println("serialLogBaudRate=" + (String)settings.serialLogBaudRate);
     settingsFile.println("printDebugMessages=" + (String)settings.printDebugMessages);
+    settingsFile.println("printUBXDebugMessages=" + (String)settings.printUBXDebugMessages);
     settingsFile.println("openNewLogFilesAfter=" + (String)settings.openNewLogFilesAfter);
     settingsFile.print("vinCorrectionFactor="); settingsFile.println(settings.vinCorrectionFactor);
     settingsFile.println("useGPIO32ForStopLogging=" + (String)settings.useGPIO32ForStopLogging);
@@ -93,6 +94,7 @@ void recordSystemSettingsToFile()
     settingsFile.println("fallingEdgeTrigger=" + (String)settings.fallingEdgeTrigger);
     settingsFile.println("timestampSerial=" + (String)settings.timestampSerial);
     settingsFile.println("timeStampToken=" + (String)settings.timeStampToken);
+    settingsFile.println("echoSerial=" + (String)settings.echoSerial);
     updateDataFileAccess(&settingsFile); // Update the file access time & date
     settingsFile.close();
   }
@@ -245,6 +247,8 @@ bool parseLine(char* str) {
     settings.serialLogBaudRate = d;
   else if (strcmp(settingName, "printDebugMessages") == 0)
     settings.printDebugMessages = d;
+  else if (strcmp(settingName, "printUBXDebugMessages") == 0)
+    settings.printUBXDebugMessages = d;
   else if (strcmp(settingName, "openNewLogFilesAfter") == 0)
     settings.openNewLogFilesAfter = d;
   else if (strcmp(settingName, "vinCorrectionFactor") == 0)
@@ -263,6 +267,8 @@ bool parseLine(char* str) {
     settings.timestampSerial = d;
   else if (strcmp(settingName, "timeStampToken") == 0)
     settings.timeStampToken = d;
+  else if (strcmp(settingName, "echoSerial") == 0)
+    settings.echoSerial = d;
   else
     {
       SerialPrintf2("Unknown setting %s. Ignoring...\r\n", settingName);

@@ -5,7 +5,7 @@
   Based on: OpenLog Artemis
   By: Nathan Seidle
   SparkFun Electronics
-  Date: September 18th 2021
+  Date: September 26th 2021
   
   Feel like supporting our work? Buy a board from SparkFun!
   https://www.sparkfun.com/products/16832
@@ -14,9 +14,15 @@
   The code uses two threads to buffer the incoming serial data and write it to SD card.
   A large variety of system settings can be adjusted by connecting at 115200bps.
 
+  Limitations:
+    This code works well with baud rates up to 230400.
+    Near-continuous (80% duty) logging of NMEA data at 230400 (close to 20KB/s) produces clean log files.
+    The wheels come off at 460800 baud, for reasons I don't yet understand.
+
   The Board should be set to SparkFun Apollo3 \ RedBoard Artemis ATP.
 
-  Please note: this version of the firmware compiles on v2.1.0 of the Apollo3 boards.
+  Please note: this version of the firmware was compiled with v2.1.0 of the Apollo3 boards.
+  v2.2.0 of Apollo3 should work nicely too.
 
   The code uses v2.0.7 of SdFat by Bill Greiman (_not_ v2.1.0).
 
@@ -36,6 +42,7 @@ const int FIRMWARE_VERSION_MINOR = 0;
 #define OLA_IDENTIFIER 0x410 // Stored as 1040 decimal in OLA_Serial_settings.txt
 
 #include "settings.h"
+#include "RingBufferNPlus.h"
 
 //Define the pin functions
 //Depends on hardware version. This can be found as a marking on the PCB.
@@ -125,16 +132,17 @@ const int sdPowerDownDelay = 100; //Delay for this many ms before turning off th
 Apollo3RTC myRTC; //Create instance of RTC class
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
-volatile unsigned long lastSeriaLogSyncTime = 0;
-const unsigned long MAX_IDLE_TIME_MSEC = 1000;
-#define incomingBufferSize (512*64)
-volatile char incomingBuffer[incomingBufferSize]; //This size of this buffer is sensitive
-volatile int incomingBufferSpot = 0;
-volatile unsigned long charsReceived = 0; //Used for verifying/debugging serial reception
-//-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
-
 //Global variables
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+volatile unsigned long lastSeriaLogSyncTime = 0;
+volatile unsigned long lastSerialCharTime = 0;
+const unsigned long SYNC_FILE_AFTER_MSEC = 1000;
+RingBufferNPlus incomingBuffer; //Serial RX buffer. This size of this buffer is sensitive
+#define sdWriteSize (512)
+volatile char sdBuffer[sdWriteSize]; // SD-Write buffer
+volatile int sdBufferLen = 0;
+volatile bool sdBufferDoSync = false;
+volatile unsigned long charsReceived = 0; //Used for verifying/debugging serial reception
 volatile unsigned long lastSDFileNameChangeTime; //Used to calculate the interval since the last SD filename change
 const byte menuTimeout = 15; //Menus will exit/timeout after this number of seconds
 volatile static bool stopLoggingSeen = false; //Flag to indicate if we should stop logging
@@ -144,6 +152,8 @@ volatile static bool triggerEdgeSeen = false; //Flag to indicate if a trigger in
 volatile char serialTimestamp[40]; //Buffer to store serial timestamp, if needed
 volatile size_t timestampCharsLeftToWrite = 0; // The length of serialTimestamp
 volatile static bool powerLossSeen = false; //Flag to indicate if a power loss event has been seen
+volatile bool muteTerminalOutput = false; //Simple (non-mutex) flag to mute the terminal output when the menus are open
+volatile bool printCharsReceivedNow = false; //Flag to indicate when is a good time to print charsReceive
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
 // gfvalvo's flash string helper code: https://forum.arduino.cc/index.php?topic=533118.msg3634809#msg3634809
@@ -165,43 +175,87 @@ void DoSerialPrint(char (*)(const char *), const char *, bool newLine = false);
 // create a Thread object (from the rtos namespace)
 // https://os.mbed.com/docs/mbed-os/v6.2/apis/thread.html
 
-rtos::Thread thread1;  
+rtos::Thread thread1;
+volatile bool thread1Run = true;
+volatile bool thread1IsRunning = false;
 rtos::Thread thread2;
+volatile bool thread2Run = true;
+volatile bool thread2IsRunning = false;
 
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
-volatile bool threadSerialRXrun = true;
-volatile bool muteTerminalOutput = false;
-volatile bool threadSDrun = true;
+// UBX and NMEA Parse State
+#define looking_for_B5_dollar   0
+#define looking_for_62          1
+#define looking_for_class       2
+#define looking_for_ID          3
+#define looking_for_length_LSB  4
+#define looking_for_length_MSB  5
+#define processing_payload      6
+#define looking_for_checksum_A  7
+#define looking_for_checksum_B  8
+#define sync_lost               9
+#define looking_for_asterix     10
+#define looking_for_csum1       11
+#define looking_for_csum2       12
+#define looking_for_term1       13
+#define looking_for_term2       14
+volatile int ubx_nmea_state = looking_for_B5_dollar;
+volatile int ubx_length = 0;
+volatile int ubx_class = 0;
+volatile int ubx_ID = 0;
+volatile int ubx_checksum_A = 0;
+volatile int ubx_checksum_B = 0;
+volatile int ubx_expected_checksum_A = 0;
+volatile int ubx_expected_checksum_B = 0;
+volatile int nmea_char_1 = '0'; // e.g. G
+volatile int nmea_char_2 = '0'; // e.g. P
+volatile int nmea_char_3 = '0'; // e.g. G
+volatile int nmea_char_4 = '0'; // e.g. G
+volatile int nmea_char_5 = '0'; // e.g. A
+volatile int nmea_csum = 0;
+volatile int nmea_csum1 = '0';
+volatile int nmea_csum2 = '0';
+volatile int nmea_expected_csum1 = '0';
+volatile int nmea_expected_csum2 = '0';
+#define max_nmea_len 128 // Maximum length for an NMEA message: use this to detect if we have lost sync while receiving an NMEA message
 
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
 
 // This thread reads the incoming serial data and stores it in incomingBuffer
 void thread_serial_rx(void)
 {
   while (1)
   {
-    if (threadSerialRXrun)
+    thread1IsRunning = true; // Flag that this thread is running
+      
+    while (thread1Run)
     {
       if (Serial1.available() || (timestampCharsLeftToWrite > 0))
       {
         while (Serial1.available() || (timestampCharsLeftToWrite > 0))
         {
+          uint8_t c;
           if (timestampCharsLeftToWrite > 0) // Based on code written by @DennisMelamed in PR #70
           {
-            incomingBuffer[incomingBufferSpot] = serialTimestamp[0]; // Add a timestamp character to incomingBuffer
+            c = serialTimestamp[0];
+            incomingBuffer.store_char(c); // Add a timestamp character to incomingBuffer
     
             // Shuffle the remaining chars along by one
-            memmove((void *)&serialTimestamp[0], (const void *)&serialTimestamp[1], (size_t)timestampCharsLeftToWrite);
+            memmove((char *)&serialTimestamp[0], (const char *)&serialTimestamp[1], (size_t)timestampCharsLeftToWrite);
     
             timestampCharsLeftToWrite -= 1;
           }
           else
           {
-            incomingBuffer[incomingBufferSpot] = Serial1.read();
+            c = Serial1.read();
+            incomingBuffer.store_char(c);
     
+            charsReceived++; // Update the serial character count
+  
             //Get the RTC timestamp if we just received the timestamp token
-            if (settings.timestampSerial && (incomingBuffer[incomingBufferSpot] == settings.timeStampToken))
+            if (settings.timestampSerial && (c == settings.timeStampToken))
             {
               getTimeString(&serialTimestamp[3]);
               serialTimestamp[0] = '\r'; // Add Carriage Return and Line Feed at the start of the timestamp
@@ -209,66 +263,320 @@ void thread_serial_rx(void)
               serialTimestamp[2] = '^'; // Add an up-arrow to indicate the timestamp relates to the preceeding data
               timestampCharsLeftToWrite = strlen((const char *)&serialTimestamp[0]);
             }
+
+            if (settings.printUBXDebugMessages && !muteTerminalOutput) 
+            {
+              // NMEA and UBX parsing - process data bytes according to ubx_nmea_state
+              // For UBX messages:
+              // Sync Char 1: 0xB5
+              // Sync Char 2: 0x62
+              // Class byte
+              // ID byte
+              // Length: two bytes, little endian
+              // Payload: length bytes
+              // Checksum: two bytes
+              // For NMEA messages:
+              // Starts with a '$'
+              // The next five characters indicate the message type (stored in nmea_char_1 to nmea_char_5)
+              // Message fields are comma-separated
+              // Followed by an '*'
+              // Then a two character checksum (the logical exclusive-OR of all characters between the $ and the * as ASCII hex)
+              // Ends with CR LF
+              // Only allow a new file to be opened when a complete packet has been processed and ubx_nmea_state has returned to "looking_for_B5_dollar"
+              // Or when a data error is detected (sync_lost)
+              switch (ubx_nmea_state) {
+                case (sync_lost):
+                case (looking_for_B5_dollar): {
+                  if (c == 0xB5) { // Have we found Sync Char 1 (0xB5) if we were expecting one?
+                    ubx_nmea_state = looking_for_62; // Now look for Sync Char 2 (0x62)
+                  }
+                  else if (c == '$') { // Have we found an NMEA '$' if we were expecting one?
+                    ubx_nmea_state = looking_for_asterix; // Now keep going until we receive an asterix
+                    ubx_length = 0; // Reset ubx_length then use it to track which character has arrived
+                    nmea_csum = 0; // Reset the nmea_csum. Update it as each character arrives
+                    nmea_char_1 = '0'; // Reset the first five NMEA chars to something invalid
+                    nmea_char_2 = '0';
+                    nmea_char_3 = '0';
+                    nmea_char_4 = '0';
+                    nmea_char_5 = '0';
+                  }
+                  else {
+                    printDebug("\r\nPanic!! Was expecting Sync Char 0xB5 or an NMEA $ but did not receive one!\r\n");
+                    ubx_nmea_state = sync_lost;
+                  }
+                }
+                break;
+                case (looking_for_62): {
+                  if (c == 0x62) { // Have we found Sync Char 2 (0x62) when we were expecting one?
+                    ubx_expected_checksum_A = 0; // Reset the expected checksum
+                    ubx_expected_checksum_B = 0;
+                    ubx_nmea_state = looking_for_class; // Now look for Class byte
+                  }
+                  else {
+                    printDebug("\r\nPanic!! Was expecting Sync Char 0x62 but did not receive one!\r\n");
+                    ubx_nmea_state = sync_lost;
+                  }
+                }
+                break;
+                case (looking_for_class): {
+                  ubx_class = c;
+                  ubx_expected_checksum_A = ubx_expected_checksum_A + c; // Update the expected checksum
+                  ubx_expected_checksum_B = ubx_expected_checksum_B + ubx_expected_checksum_A;
+                  ubx_nmea_state = looking_for_ID; // Now look for ID byte
+                }
+                break;
+                case (looking_for_ID): {
+                  ubx_ID = c;
+                  ubx_expected_checksum_A = ubx_expected_checksum_A + c; // Update the expected checksum
+                  ubx_expected_checksum_B = ubx_expected_checksum_B + ubx_expected_checksum_A;
+                  ubx_nmea_state = looking_for_length_LSB; // Now look for length LSB
+                }
+                break;
+                case (looking_for_length_LSB): {
+                  ubx_length = c; // Store the length LSB
+                  ubx_expected_checksum_A = ubx_expected_checksum_A + c; // Update the expected checksum
+                  ubx_expected_checksum_B = ubx_expected_checksum_B + ubx_expected_checksum_A;
+                  ubx_nmea_state = looking_for_length_MSB; // Now look for length MSB
+                }
+                break;
+                case (looking_for_length_MSB): {
+                  ubx_length = ubx_length + (c * 256); // Add the length MSB
+                  ubx_expected_checksum_A = ubx_expected_checksum_A + c; // Update the expected checksum
+                  ubx_expected_checksum_B = ubx_expected_checksum_B + ubx_expected_checksum_A;
+                  ubx_nmea_state = processing_payload; // Now look for payload bytes (length: ubx_length)
+                }
+                break;
+                case (processing_payload): {
+                  ubx_length = ubx_length - 1; // Decrement length by one
+                  ubx_expected_checksum_A = ubx_expected_checksum_A + c; // Update the expected checksum
+                  ubx_expected_checksum_B = ubx_expected_checksum_B + ubx_expected_checksum_A;
+                  if (ubx_length == 0) {
+                    ubx_expected_checksum_A = ubx_expected_checksum_A & 0xff; // Limit checksums to 8-bits
+                    ubx_expected_checksum_B = ubx_expected_checksum_B & 0xff;
+                    ubx_nmea_state = looking_for_checksum_A; // If we have received length payload bytes, look for checksum bytes
+                  }
+                }
+                break;
+                case (looking_for_checksum_A): {
+                  ubx_checksum_A = c;
+                  ubx_nmea_state = looking_for_checksum_B;
+                }
+                break;
+                case (looking_for_checksum_B): {
+                  ubx_checksum_B = c;
+                  ubx_nmea_state = looking_for_B5_dollar; // All bytes received so go back to looking for a new Sync Char 1 unless there is a checksum error
+                  if ((ubx_expected_checksum_A != ubx_checksum_A) or (ubx_expected_checksum_B != ubx_checksum_B)) {
+                    printDebug("\r\nPanic!! UBX checksum error!\r\n");
+                    ubx_nmea_state = sync_lost;
+                  }
+                }
+                break;
+                // NMEA messages
+                case (looking_for_asterix): {
+                  ubx_length++; // Increase the message length count
+                  if (ubx_length > max_nmea_len) { // If the length is greater than max_nmea_len, something bad must have happened (sync_lost)
+                    printDebug("\r\nPanic!! Excessive NMEA message length!\r\n");
+                    ubx_nmea_state = sync_lost;
+                    break;
+                  }
+                  // If this is one of the first five characters, store it
+                  // May be useful for on-the-fly message parsing or DEBUG
+                  if (ubx_length <= 5) {
+                    if (ubx_length == 1) {
+                      nmea_char_1 = c;
+                    }
+                    else if (ubx_length == 2) {
+                      nmea_char_2 = c;
+                    }
+                    else if (ubx_length == 3) {
+                      nmea_char_3 = c;
+                    }
+                    else if (ubx_length == 4) {
+                      nmea_char_4 = c;
+                    }
+                    else { // ubx_length == 5
+                      nmea_char_5 = c;
+                    }
+                  }
+                  // Now check if this is an '*'
+                  if (c == '*') {
+                    // Asterix received
+                    // Don't exOR it into the checksum
+                    // Instead calculate what the expected checksum should be (nmea_csum in ASCII hex)
+                    nmea_expected_csum1 = ((nmea_csum & 0xf0) >> 4) + '0'; // Convert MS nibble to ASCII hex
+                    if (nmea_expected_csum1 >= ':') { nmea_expected_csum1 += 7; } // : follows 9 so add 7 to convert to A-F
+                    nmea_expected_csum2 = (nmea_csum & 0x0f) + '0'; // Convert LS nibble to ASCII hex
+                    if (nmea_expected_csum2 >= ':') { nmea_expected_csum2 += 7; } // : follows 9 so add 7 to convert to A-F
+                    // Next, look for the first csum character
+                    ubx_nmea_state = looking_for_csum1;
+                    break; // Don't include the * in the checksum
+                  }
+                  // Now update the checksum
+                  // The checksum is the exclusive-OR of all characters between the $ and the *
+                  nmea_csum = nmea_csum ^ c;
+                }
+                break;
+                case (looking_for_csum1): {
+                  // Store the first NMEA checksum character
+                  nmea_csum1 = c;
+                  ubx_nmea_state = looking_for_csum2;
+                }
+                break;
+                case (looking_for_csum2): {
+                  // Store the second NMEA checksum character
+                  nmea_csum2 = c;
+                  // Now check if the checksum is correct
+                  if ((nmea_csum1 != nmea_expected_csum1) or (nmea_csum2 != nmea_expected_csum2)) {
+                    // The checksum does not match so sync_lost
+                    printDebug("\r\nPanic!! NMEA checksum error!\r\n");
+                    ubx_nmea_state = sync_lost;
+                  }
+                  else {
+                    // Checksum was valid so wait for the terminators
+                    ubx_nmea_state = looking_for_term1;
+                  }
+                }
+                break;
+                case (looking_for_term1): {
+                  // Check if this is CR
+                  if (c != '\r') {
+                    printDebug("\r\nPanic!! NMEA CR not found!\r\n");
+                    ubx_nmea_state = sync_lost;
+                  }
+                  else {
+                    ubx_nmea_state = looking_for_term2;
+                  }
+                }
+                break;
+                case (looking_for_term2): {
+                  // Check if this is LF
+                  if (c != '\n') {
+                    printDebug("\r\nPanic!! NMEA LF not found!\r\n");
+                    ubx_nmea_state = sync_lost;
+                  }
+                  else {
+                    // LF was received so go back to looking for B5 or a $
+                    ubx_nmea_state = looking_for_B5_dollar;
+                  }
+                }
+                break;
+              }
+            }
           }
     
           //Print to terminal
           if ((settings.enableTerminalOutput == true) && (muteTerminalOutput == false))
-            Serial.write(incomingBuffer[incomingBufferSpot]); //Print to terminal
-    
-          //Increment the buffer pointer - unless the buffer is full
-          if (incomingBufferSpot < (incomingBufferSize - 1))
-            incomingBufferSpot++;
-            
-          charsReceived++; // Update the serial character count
+          {
+            if (Serial.write(c) != (size_t)1) //Print to terminal
+            {
+              delay(1);
+              Serial.write(c); //Try again if TX buffer was full
+            }
+          }
+          //Echo the data on Serial1 TX
+          if ((settings.echoSerial == true))
+          {
+            if (Serial1.write(c) != (size_t)1) //Print to terminal
+            {
+              delay(1);
+              Serial1.write(c); //Try again if TX buffer was full
+            }
+          }
+
+          lastSerialCharTime = millis(); // Update lastSerialCharTime
         }
       }
+  
+      //Check if we have enough data for a full SD write and if the SD-Write buffer is empty
+      if ((incomingBuffer.available() >= sdWriteSize) && (sdBufferLen == 0))
+      {
+        //Copy sdWriteSize bytes from incomingBuffer into sdBuffer
+        incomingBuffer.read_chars((volatile char *)&sdBuffer[0], sdWriteSize);
+        //Clear sdBufferDoSync
+        sdBufferDoSync = false;
+        //Update sdBufferLen
+        sdBufferLen = sdWriteSize;
+      }    
+      //Periodically sync the log file: write any remaining data if the SD-Write buffer is empty
+      else if (((millis() - lastSeriaLogSyncTime) > SYNC_FILE_AFTER_MSEC) && (incomingBuffer.available() > 0) && (sdBufferLen == 0))
+      {
+        //Now is a good time to print charsReceived if required
+        printCharsReceivedNow = true;
+        //Copy available bytes from incomingBuffer into sdBuffer
+        int incomingBufferAvailable = incomingBuffer.available();
+        incomingBuffer.read_chars((volatile char *)&sdBuffer[0], incomingBufferAvailable);
+        //Set sdBufferDoSync
+        sdBufferDoSync = true;
+        //Update sdBufferLen
+        sdBufferLen = incomingBufferAvailable;
+        //Update lastSeriaLogSyncTime
+        lastSeriaLogSyncTime = millis();
+      }
+
+      if (sdBufferLen > 0)
+      {
+        delay(1); // Let the other threads get a foot in the door
+      }
+      else if ((millis() - lastSerialCharTime) > 10)
+      {
+        delay(1); // Let the other threads get a foot in the door
+        lastSerialCharTime = millis();
+      }
+    }
+
+    thread1IsRunning = false; // Flag that this thread is not running
+
+    while (!thread1Run)
+    {
+      // Spin the wheels...
+      delay(10);
     }
   }
 }
 
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
-// This thread writes the data in incomingBuffer to SD card
+// This thread writes the data in sdBuffer to SD card
 void thread_sd_write(void)
 {
   while (1)
   {
-    if (threadSDrun)
+    thread2IsRunning = true; // Flag that this thread is running
+      
+    while (thread2Run)
     {
-      if (settings.logSerial == true && online.serialLogging == true)
+      if (sdBufferLen > 0) // Is there any data waiting to be written?
       {
-        while (incomingBufferSpot >= 512) // Is there enough data in the buffer for a complete write?
+        if ((settings.logSerial == true) && (online.serialLogging == true))
         {
           digitalWrite(PIN_STAT_LED, HIGH); //Toggle stat LED to indicating log recording
-          serialDataFile.write((const uint8_t *)&incomingBuffer[0], 512); //Record the buffer to the card
-          digitalWrite(PIN_STAT_LED, LOW);
-          memmove((void *)&incomingBuffer[0], (const void *)&incomingBuffer[512], (size_t)(incomingBufferSize - 512));
-          incomingBufferSpot -= 512;
     
-          if ((millis() - lastSeriaLogSyncTime) > MAX_IDLE_TIME_MSEC) //Should we sync the log file?
-          {
-            serialDataFile.sync();
-            lastSeriaLogSyncTime = millis(); //Reset the last sync time to now
-          }
-        }
+          serialDataFile.write((char *)sdBuffer, sdBufferLen); //Record the buffer to the card
     
-        if ((millis() - lastSeriaLogSyncTime) > MAX_IDLE_TIME_MSEC) //If we haven't received any characters recently then sync log file
-        {
-          if (incomingBufferSpot > 0)
+          if (sdBufferDoSync) //Should we sync the log file?
           {
-            //Write the remainder of the buffer
-            digitalWrite(PIN_STAT_LED, HIGH); //Toggle stat LED to indicating log recording
-            serialDataFile.write((const uint8_t *)&incomingBuffer[0], (size_t)incomingBufferSpot); //Record the buffer to the card
             serialDataFile.sync();
             updateDataFileAccess(&serialDataFile); // Update the file access time & date
-            digitalWrite(PIN_STAT_LED, LOW);
-            incomingBufferSpot = 0;
           }
-          lastSeriaLogSyncTime = millis(); //Reset the last sync time to now
-          if (muteTerminalOutput == false)
-            printDebug("\r\nTotal chars received: " + (String)charsReceived + "\r\n");
+    
+          sdBufferLen = 0;
+          
+          digitalWrite(PIN_STAT_LED, LOW);
+        }
+        else
+        {
+          sdBufferLen = 0; // Clean up if we are not writing to SD card
         }
       }
+      delay(10); // Let the other threads get a foot in the door
+    }
+
+    thread2IsRunning = false; // Flag that this thread is not running
+
+    while (!thread2Run)
+    {
+      // Spin the wheels...
+      delay(10);
     }
   }
 }
@@ -277,6 +585,7 @@ void thread_sd_write(void)
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
 void setup() {
+  
   //If 3.3V rail drops below 3V, system will power down and maintain RTC
   pinMode(PIN_POWER_LOSS, INPUT); // BD49K30G-TL has CMOS output and does not need a pull-up
 
@@ -351,7 +660,7 @@ void setup() {
 
   serialTimestamp[0] = '\0'; // Empty the serial timestamp buffer
 
-  beginSerialLogging(); //20 - 99ms
+  beginSerialLogging();
 
   if (online.microSD == true) SerialPrintln(F("SD card online"));
   else SerialPrintln(F("SD card offline"));
@@ -361,49 +670,74 @@ void setup() {
 
   if (settings.enableTerminalOutput == false && online.serialLogging == true)
     SerialPrintln(F("Logging to microSD card with no terminal output"));
+  else
+    SerialPrintln(F("You may need to disable \"Display serial data in terminal\" via the Serial Logging Menu when logging at high data/baud rates."));
 
   //Clear any spurious serial data
   while (Serial1.available())
     Serial1.read();
 
-  //Start the threads
-  thread1.start(thread_serial_rx);
-  thread2.start(thread_sd_write);
-
   digitalWrite(PIN_STAT_LED, LOW); // Turn the STAT LED off now that everything is configured
+
+  //Start the threads
+  startThreads();
+}
+
+//-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
+void startThreads(void)
+{
+  thread1Run = true;
+  thread1.start(thread_serial_rx);
+  thread1.set_priority(osPriorityNormal1);
+  thread2Run = true;
+  thread2.start(thread_sd_write);
+}
+
+void pauseThreads(void)
+{
+  thread1Run = false;
+  thread2Run = false;
+  while (thread1IsRunning)
+    delay(1);
+  while (thread2IsRunning)
+    delay(1);
+}
+
+void pauseThread2(void)
+{
+  thread2Run = false;
+  while (thread2IsRunning)
+    delay(1);
+}
+
+void restartThreads(void)
+{
+  thread1Run = true;
+  thread2Run = true;
 }
 
 //-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
 void loop() {
 
-  //Pause the threads
-  threadSerialRXrun = false;
-  threadSDrun = false;
-
   checkBattery(); // Check for low battery
-
-  //Unpause the serial rx thread
-  threadSerialRXrun = true;
 
   //Check for a New File trigger event
   if (((settings.useGPIO11ForTrigger == true) && (triggerEdgeSeen == true))
    || ((settings.openNewLogFilesAfter > 0) && ((millis() - lastSDFileNameChangeTime) > (settings.openNewLogFilesAfter * 1000))))
   {
+    pauseThreads();
     triggerEdgeSeen = false;
     openNewLogFile();
     lastSDFileNameChangeTime = millis(); // Record the time of the file name change
+    restartThreads();
   }
 
   if ((settings.useGPIO32ForStopLogging == true) && (stopLoggingSeen == true)) // Has the user pressed the stop logging button?
   {
-    stopLoggingSeen = false;
-    threadSerialRXrun = false;
     stopLogging();
   }
-
-  //Unpause the SD write thread
-  threadSDrun = true;
 
   if (Serial.available())
   {
@@ -412,10 +746,17 @@ void loop() {
     muteTerminalOutput = false;
   }
 
+  if (printCharsReceivedNow)
+  {
+     printDebug("\r\nTotal chars received: " + (String)charsReceived + "\r\n");
+     printCharsReceivedNow = false;
+  }
+
   //Let the threads do their thing
   delay(100);
-
 }
+
+//-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
 void beginQwiic()
 {
@@ -579,15 +920,19 @@ void openNewLogFile()
 {
   if (online.microSD == true && online.serialLogging == true)
   {
-    if (incomingBufferSpot > 0)
+    int incomingBufferAvailable = incomingBuffer.available();
+    if (incomingBufferAvailable > 0)
     {
       //Write the remainder of the buffer
       digitalWrite(PIN_STAT_LED, HIGH); //Toggle stat LED to indicating log recording
-      serialDataFile.write((const uint8_t *)&incomingBuffer[0], (size_t)incomingBufferSpot); //Record the buffer to the card
+
+      //Copy available bytes from incomingBuffer into sdBuffer
+      incomingBuffer.read_chars((char *)&sdBuffer[0], incomingBufferAvailable);
+      serialDataFile.write((char *)&sdBuffer[0], incomingBufferAvailable); //Record the buffer to the card      
+      
       serialDataFile.sync();
       updateDataFileAccess(&serialDataFile); // Update the file access time & date
       digitalWrite(PIN_STAT_LED, LOW);
-      incomingBufferSpot = 0;
     }
     lastSeriaLogSyncTime = millis(); //Reset the last sync time to now
     printDebug("Total chars received: " + (String)charsReceived + "\r\n");
@@ -608,6 +953,75 @@ void openNewLogFile()
 
     updateDataFileCreate(&serialDataFile); // Update the file create time & date
   }
+}
+
+//Returns next available log file name
+//Checks the spots in EEPROM for the next available LOG# file name
+//Updates EEPROM and then appends to the new log file.
+char* findNextAvailableLog(int &newFileNumber, const char *fileLeader)
+{
+  SdFile newFile; //This will contain the file for SD writing
+
+  if (newFileNumber < 2) //If the settings have been reset, let's warn the user that this could take a while!
+  {
+    SerialPrintln(F("Finding the next available log file."));
+    SerialPrintln(F("This could take a long time if the SD card contains many existing log files."));
+  }
+
+  if (newFileNumber > 0)
+    newFileNumber--; //Check if last log file was empty. Reuse it if it is.
+
+  //Search for next available log spot
+  static char newFileName[40];
+  while (1)
+  {
+    char newFileNumberStr[6];
+    if (newFileNumber < 10)
+      sprintf(newFileNumberStr, "0000%d", newFileNumber);
+    else if (newFileNumber < 100)
+      sprintf(newFileNumberStr, "000%d", newFileNumber);
+    else if (newFileNumber < 1000)
+      sprintf(newFileNumberStr, "00%d", newFileNumber);
+    else if (newFileNumber < 10000)
+      sprintf(newFileNumberStr, "0%d", newFileNumber);
+    else
+      sprintf(newFileNumberStr, "%d", newFileNumber);
+    sprintf(newFileName, "%s%s.TXT", fileLeader, newFileNumberStr); //Splice the new file number into this file name. Max no. is 99999.
+
+    if (sd.exists(newFileName) == false) break; //File name not found so we will use it.
+
+    //File exists so open and see if it is empty. If so, use it.
+    newFile.open(newFileName, O_READ);
+    if (newFile.fileSize() == 0) break; // File is empty so we will use it. Note: we need to make the user aware that this can happen!
+
+    newFile.close(); // Close this existing file we just opened.
+
+    newFileNumber++; //Try the next number
+    if (newFileNumber >= 100000) break; // Have we hit the maximum number of files?
+  }
+  
+  newFile.close(); //Close this new file we just opened
+
+  newFileNumber++; //Increment so the next power up uses the next file #
+
+  if (newFileNumber >= 100000) // Have we hit the maximum number of files?
+  {
+    SerialPrint(F("***** WARNING! File number limit reached! (Overwriting "));
+    SerialPrint(newFileName);
+    SerialPrintln(F(") *****"));
+    newFileNumber = 100000; // This will overwrite Log99999.TXT next time thanks to the newFileNumber-- above
+  }
+  else
+  {
+    SerialPrint(F("Logging to: "));
+    SerialPrintln(newFileName);    
+  }
+
+  //Record new file number to EEPROM and to config file
+  //This works because newFileNumber is a pointer to settings.newFileNumber
+  recordSystemSettings();
+
+  return (newFileName);
 }
 
 #if SD_FAT_TYPE == 1

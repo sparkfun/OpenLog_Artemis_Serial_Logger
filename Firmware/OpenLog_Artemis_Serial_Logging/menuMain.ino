@@ -41,9 +41,7 @@ void menuMain()
       byte bContinue = getByteChoice(menuTimeout);
       if (bContinue == 'y')
       {
-        //Pause the threads
-        threadSerialRXrun = false;
-        threadSDrun = false;
+        pauseThreads();
 
         //Save files before going to sleep
         if (online.serialLogging == true)
@@ -60,7 +58,8 @@ void menuMain()
         SerialPrint(F("Settings erased. Please reset OpenLog Artemis and open a terminal at "));
         Serial.print((String)settings.serialTerminalBaudRate);
         SerialPrintln(F("bps..."));
-        while (1);
+        delay(sdPowerDownDelay); // Give the SD card time to shut down
+        powerDownOLA();
       }
       else
         SerialPrintln(F("Reset aborted"));
@@ -71,9 +70,7 @@ void menuMain()
       byte bContinue = getByteChoice(menuTimeout);
       if (bContinue == 'y')
       {
-        //Pause the threads
-        threadSerialRXrun = false;
-        threadSDrun = false;
+        pauseThreads();
         
         //Save files before going to sleep
         if (online.serialLogging == true)
@@ -83,6 +80,8 @@ void menuMain()
           serialDataFile.close();
         }
         
+        recordSystemSettings(); //The settings may have changed. Record the new settings to EEPROM and config file
+
         SerialPrint(F("Log files are closed. Please reset OpenLog Artemis and open a terminal at "));
         Serial.print((String)settings.serialTerminalBaudRate);
         SerialPrintln(F("bps..."));
@@ -100,13 +99,11 @@ void menuMain()
       printUnknown(incoming);
   }
 
-  //Pause the SD thread
-  threadSDrun = false;
+  SerialPrintln(F("Returning to logging..."));
 
+  pauseThread2();
   recordSystemSettings(); //Once all menus have exited, record the new settings to EEPROM and config file
-
-  //Unpause the SD thread
-  threadSDrun = true;
+  restartThreads();
 
   while (Serial.available()) Serial.read(); //Empty buffer of any newline chars
 }
