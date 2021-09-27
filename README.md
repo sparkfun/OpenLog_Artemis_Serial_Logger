@@ -24,7 +24,6 @@ Repository Contents
 
 * **/Binaries** - The binary files for the different versions of the OLA firmware.
 * **/Firmware** - The main sketch that runs on the OpenLog Artemis.
-* **/Utils** - Python utilities to help debug any logging gremlins.
 
 Documentation
 --------------
